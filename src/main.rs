@@ -1,11 +1,11 @@
-// This starter uses the `axum` crate to create an asyncrohnous web server
+// This starter uses the `axum` crate to create an asynchronous web server
 // The async runtime being used, is `tokio`
 // This starter also has logging, powered by `tracing` and `tracing-subscriber`
 
 use axum::{http::StatusCode, response::IntoResponse, routing::get, Json, Router};
 use std::net::SocketAddr;
 
-// This derive macro allows our main function to run asyncrohnous code. Without it, the main function would run syncrohnously
+// This derive macro allows our main function to run asynchronous code. Without it, the main function would run synchronously
 #[tokio::main]
 async fn main() {
     // First, we initialize the tracing subscriber with default configuration
@@ -43,13 +43,9 @@ async fn main() {
     tracing::info!("listening on {}", addr);
     // Then, we run the server, using the `bind` method on `Server`
     // `axum::Server` is a re-export of `hyper::Server`
-    axum::Server::bind(&addr)
-        // We then convert our Router into a `Service`, provided by `tower`
-        .serve(app.into_make_service())
-        // This function is async, so we need to await it
-        .await
-        // Then, we unwrap the result, to which if it fails, we panic
-        .unwrap();
+    // run our app with hyper, listening globally on port 3000
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
 }
 
 // This is our route handler, for the route root
