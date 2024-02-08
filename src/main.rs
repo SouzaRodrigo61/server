@@ -2,16 +2,28 @@
 // The async runtime being used, is `tokio`
 // This starter also has logging, powered by `tracing` and `tracing-subscriber`
 
-use axum::{http::StatusCode, response::IntoResponse, routing::get, Json, Router};
 use std::net::SocketAddr;
 
-// This derive macro allows our main function to run asynchronous code. Without it, the main function would run synchronously
-#[tokio::main]
-async fn main() {
-    // First, we initialize the tracing subscriber with default configuration
-    // This is what allows us to print things to the console
-    tracing_subscriber::fmt::init();
+use axum::{extract::{MatchedPath, Request}, middleware::{self, Next}, response::IntoResponse, routing::get, Router, Json};
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
+use std::{
+    future::ready,
+    time::{Instant},
+};
+use std::time::Duration;
+use axum::error_handling::HandleErrorLayer;
 
+use tower::{BoxError, ServiceBuilder};
+use tower_http::trace::TraceLayer;
+use axum::http::StatusCode;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+fn metrics_app() -> Router {
+    let recorder_handle = setup_metrics_recorder();
+    Router::new().route("/metrics", get(move || ready(recorder_handle.render())))
+}
+
+fn main_app() -> Router {
     // Then, we create a router, which is a way of routing requests to different handlers
     let app = Router::new()
         // In order to add a route, we use the `route` method on the router
@@ -24,28 +36,84 @@ async fn main() {
         // This can be repeated as many times as you want to create more routes
         // We are also going to create a more complex route, using `impl IntoResponse`
         // The code of the complex function is below
-        .route("/complex", get(complex));
+        .route("/complex", get(complex))
+        .route_layer(middleware::from_fn(track_metrics))
+        // Add middleware to all routes
+        .layer(
+            ServiceBuilder::new()
+                .layer(HandleErrorLayer::new(|error: BoxError| async move {
+                    if error.is::<tower::timeout::error::Elapsed>() {
+                        Ok(StatusCode::REQUEST_TIMEOUT)
+                    } else {
+                        Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Unhandled internal error: {error}"),
+                        ))
+                    }
+                }))
+                .timeout(Duration::from_secs(10))
+                .layer(TraceLayer::new_for_http())
+                .into_inner(),
+        );
+    app
+}
 
-    // Next, we need to run our app with `hyper`, which is the HTTP server used by `axum`
-    // We need to create a `SocketAddr` to run our server on
-    // Before we can create that, we need to get the port we wish to serve on
-    // This code attempts to get the port from the environment variable `PORT`
-    // If it fails to get the port, it will default to "3000"
-    // We then parse the `String` into a `u16`, to which if it fails, we panic
+async fn start_main_server() {
+    let app = main_app();
+
     let port: u16 = std::env::var("PORT")
         .unwrap_or("3000".into())
         .parse()
         .expect("failed to convert to number");
     // We then create a socket address, listening on 0.0.0.0:PORT
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    // We then log the address we are listening on, using the `info!` macro
-    // The info macro is provided by `tracing`, and allows us to log stuff at an info log level
-    tracing::info!("listening on {}", addr);
-    // Then, we run the server, using the `bind` method on `Server`
-    // `axum::Server` is a re-export of `hyper::Server`
-    // run our app with hyper, listening globally on port 3000
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .unwrap();
+    tracing::info!("listening on {}", listener.local_addr().unwrap());
     axum::serve(listener, app).await.unwrap();
+}
+
+async fn start_metrics_server() {
+    let app = metrics_app();
+
+    // NOTE: expose metrics endpoint on a different port
+    let port: u16 = std::env::var("PORT_PROMETHEUS")
+        .unwrap_or("3001".into())
+        .parse()
+        .expect("failed to convert to number");
+    // We then create a socket address, listening on 0.0.0.0:PORT
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .unwrap();
+    tracing::info!("listening on {}", listener.local_addr().unwrap());
+    axum::serve(listener, app).await.unwrap();
+}
+
+
+
+#[tokio::main]
+async fn main() {
+    // First, we initialize the tracing subscriber with default configuration
+    // This is what allows us to print things to the console
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "example_todos=debug,tower_http=debug".into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
+    // The `/metrics` endpoint should not be publicly available. If behind a reverse proxy, this
+    // can be achieved by rejecting requests to `/metrics`. In this example, a second server is
+    // started on another port to expose `/metrics`.
+    let (_main_server, _metrics_server) = tokio::join!(start_main_server(), start_metrics_server());
+
+    tracing::info!("listening on main {:?}", _main_server);
+    tracing::info!("listening on metrics {:?}", _metrics_server);
 }
 
 // This is our route handler, for the route root
@@ -71,4 +139,47 @@ async fn complex() -> impl IntoResponse {
             "message": "Hello, World!"
         })),
     )
+}
+
+
+
+fn setup_metrics_recorder() -> PrometheusHandle {
+    const EXPONENTIAL_SECONDS: &[f64] = &[
+        0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+    ];
+
+    PrometheusBuilder::new()
+        .set_buckets_for_metric(
+            Matcher::Full("http_requests_duration_seconds".to_string()),
+            EXPONENTIAL_SECONDS,
+        )
+        .unwrap()
+        .install_recorder()
+        .unwrap()
+}
+
+async fn track_metrics(req: Request, next: Next) -> impl IntoResponse {
+    let start = Instant::now();
+    let path = if let Some(matched_path) = req.extensions().get::<MatchedPath>() {
+        matched_path.as_str().to_owned()
+    } else {
+        req.uri().path().to_owned()
+    };
+    let method = req.method().clone();
+
+    let response = next.run(req).await;
+
+    let latency = start.elapsed().as_secs_f64();
+    let status = response.status().as_u16().to_string();
+
+    let labels = [
+        ("method", method.to_string()),
+        ("path", path),
+        ("status", status),
+    ];
+
+    metrics::counter!("http_requests_total", &labels).increment(1);
+    metrics::histogram!("http_requests_duration_seconds", &labels).record(latency);
+
+    response
 }
