@@ -93,8 +93,6 @@ async fn start_metrics_server() {
     axum::serve(listener, app).await.unwrap();
 }
 
-
-
 #[tokio::main]
 async fn main() {
     // First, we initialize the tracing subscriber with default configuration
