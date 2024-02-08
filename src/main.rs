@@ -18,12 +18,10 @@ use tower_http::trace::TraceLayer;
 use axum::http::StatusCode;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-fn metrics_app() -> Router {
-    let recorder_handle = setup_metrics_recorder();
-    Router::new().route("/metrics", get(move || ready(recorder_handle.render())))
-}
-
 fn main_app() -> Router {
+
+    let recorder_handle = setup_metrics_recorder();
+
     // Then, we create a router, which is a way of routing requests to different handlers
     let app = Router::new()
         // In order to add a route, we use the `route` method on the router
@@ -32,6 +30,7 @@ fn main_app() -> Router {
         // We specify what HTTP method we want to accept on the route (via the `get` function)
         // And finally, we provide our route handler
         // The code of the root function is below
+        .route("/metrics", get(move || ready(recorder_handle.render())))
         .route("/", get(root))
         // This can be repeated as many times as you want to create more routes
         // We are also going to create a more complex route, using `impl IntoResponse`
@@ -75,24 +74,6 @@ async fn start_main_server() {
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn start_metrics_server() {
-    let app = metrics_app();
-
-    // NOTE: expose metrics endpoint on a different port
-    let port: u16 = std::env::var("PORT_PROMETHEUS")
-        .unwrap_or("3001".into())
-        .parse()
-        .expect("failed to convert to number");
-    // We then create a socket address, listening on 0.0.0.0:PORT
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .unwrap();
-    tracing::info!("listening on {}", listener.local_addr().unwrap());
-    axum::serve(listener, app).await.unwrap();
-}
-
 #[tokio::main]
 async fn main() {
     // First, we initialize the tracing subscriber with default configuration
@@ -108,10 +89,9 @@ async fn main() {
     // The `/metrics` endpoint should not be publicly available. If behind a reverse proxy, this
     // can be achieved by rejecting requests to `/metrics`. In this example, a second server is
     // started on another port to expose `/metrics`.
-    let (_main_server, _metrics_server) = tokio::join!(start_main_server(), start_metrics_server());
+    let (_main_server) = tokio::join!(start_main_server());
 
     tracing::info!("listening on main {:?}", _main_server);
-    tracing::info!("listening on metrics {:?}", _metrics_server);
 }
 
 // This is our route handler, for the route root
